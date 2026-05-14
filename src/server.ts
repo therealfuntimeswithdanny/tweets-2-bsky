@@ -25,10 +25,13 @@ import type { ProcessedTweet } from './db.js';
 import {
   applyProfileMirrorSyncState,
   bridgeBlueskyAccountToFediverse,
+  ensureBlueskyBotSelfLabel,
+  ensureBlueskyDisplayNameBotSuffix,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
 } from './profile-mirror.js';
+import { JWT_SECRET_FILE_PATH, UPDATE_LOG_DIR } from './storage-paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,14 +40,12 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = (process.env.HOST || process.env.BIND_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const APP_ROOT_DIR = path.join(__dirname, '..');
-const JWT_SECRET_FILE_PATH = path.join(APP_ROOT_DIR, 'data', '.jwt-secret');
 const jwtSecretFromEnv = process.env.JWT_SECRET?.trim();
 const JWT_EXPIRES_IN = ((process.env.JWT_EXPIRES_IN || '30d').trim() || '30d') as SignOptions['expiresIn'];
 const WEB_DIST_DIR = path.join(APP_ROOT_DIR, 'web', 'dist');
 const LEGACY_PUBLIC_DIR = path.join(APP_ROOT_DIR, 'public');
 const PACKAGE_JSON_PATH = path.join(APP_ROOT_DIR, 'package.json');
 const UPDATE_SCRIPT_PATH = path.join(APP_ROOT_DIR, 'update.sh');
-const UPDATE_LOG_DIR = path.join(APP_ROOT_DIR, 'data');
 const staticAssetsDir = fs.existsSync(path.join(WEB_DIST_DIR, 'index.html')) ? WEB_DIST_DIR : LEGACY_PUBLIC_DIR;
 const BSKY_APPVIEW_URL = process.env.BSKY_APPVIEW_URL || 'https://public.api.bsky.app';
 const POST_VIEW_CACHE_TTL_MS = 60_000;
@@ -2082,7 +2083,7 @@ app.post('/api/onboarding/bsky-credentials', authenticateToken, async (req: any,
   }
 });
 
-app.post('/api/mappings', authenticateToken, (req: any, res) => {
+app.post('/api/mappings', authenticateToken, async (req: any, res) => {
   if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
     res.status(403).json({ error: 'You do not have permission to create mappings.' });
     return;
@@ -2140,11 +2141,40 @@ app.post('/api/mappings', authenticateToken, (req: any, res) => {
     groupEmoji: normalizedGroupEmoji || undefined,
     createdByUserId,
     profileSyncSourceUsername,
+    hasBotLabel: false,
   };
 
   ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
   config.mappings.push(newMapping);
   saveConfig(config);
+
+  try {
+    const labelResult = await ensureBlueskyBotSelfLabel({
+      bskyIdentifier: newMapping.bskyIdentifier,
+      bskyPassword: newMapping.bskyPassword,
+      bskyServiceUrl: newMapping.bskyServiceUrl,
+    });
+
+    if (labelResult.hasBotLabel && !newMapping.hasBotLabel) {
+      newMapping.hasBotLabel = true;
+      saveConfig(config);
+    }
+
+    for (const key of [
+      normalizeActor(newMapping.bskyIdentifier),
+      normalizeActor(labelResult.bsky.handle),
+      normalizeActor(labelResult.bsky.did),
+    ]) {
+      if (key) {
+        profileCache.delete(key);
+      }
+    }
+  } catch (error) {
+    console.warn(
+      `[mapping:${newMapping.id}] Failed to apply Bluesky bot self-label during mapping creation: ${getErrorMessage(error)}`,
+    );
+  }
+
   res.json(sanitizeMapping(newMapping, createUserLookupById(config), req.user));
 });
 
@@ -2301,6 +2331,249 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
   } catch (error) {
     res.status(400).json({ error: getErrorMessage(error, 'Failed to sync Bluesky profile from Twitter.') });
   }
+});
+
+app.post('/api/mappings/:id/pull-twitter-bio', authenticateToken, async (req: any, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const mappingIndex = config.mappings.findIndex((entry) => entry.id === id);
+  const mapping = config.mappings[mappingIndex];
+
+  if (mappingIndex === -1 || !mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have permission to update this mapping.' });
+    return;
+  }
+
+  const sourceTwitterUsername = resolveProfileSyncSourceUsername({
+    twitterUsernames: mapping.twitterUsernames,
+    requestedSource: req.body?.sourceTwitterUsername,
+    fallbackSource: mapping.profileSyncSourceUsername,
+  });
+
+  if (!sourceTwitterUsername) {
+    res.status(400).json({ error: 'Mapping has no Twitter source usernames.' });
+    return;
+  }
+
+  try {
+    const result = await syncBlueskyProfileFromTwitter({
+      twitterUsername: sourceTwitterUsername,
+      bskyIdentifier: mapping.bskyIdentifier,
+      bskyPassword: mapping.bskyPassword,
+      bskyServiceUrl: mapping.bskyServiceUrl,
+      previousSync: getMappingMirrorSyncState(mapping),
+      syncDisplayName: false,
+      syncDescription: true,
+      syncAvatar: false,
+      syncBanner: false,
+    });
+
+    const updatedMapping = applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
+    config.mappings[mappingIndex] = updatedMapping;
+    saveConfig(config);
+
+    for (const key of [
+      normalizeActor(updatedMapping.bskyIdentifier),
+      normalizeActor(result.bsky.handle),
+      normalizeActor(result.bsky.did),
+    ]) {
+      if (key) {
+        profileCache.delete(key);
+      }
+    }
+
+    res.json({
+      success: true,
+      sourceTwitterUsername,
+      mapping: sanitizeMapping(updatedMapping, createUserLookupById(config), req.user),
+      ...result,
+    });
+  } catch (error) {
+    res.status(400).json({ error: getErrorMessage(error, 'Failed to pull Twitter bio.') });
+  }
+});
+
+app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res) => {
+  if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to update mappings.' });
+    return;
+  }
+
+  const config = getConfig();
+  const usersById = createUserLookupById(config);
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const requestedIds = parseMappingIds(req.body?.mappingIds);
+  const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
+  const targets = requestedIdSet
+    ? manageableMappings.filter((mapping) => requestedIdSet.has(mapping.id))
+    : manageableMappings;
+
+  if (targets.length === 0) {
+    res.status(400).json({ error: 'No manageable mappings available for bot label update.' });
+    return;
+  }
+
+  let labeled = 0;
+  let alreadyLabeled = 0;
+  let failed = 0;
+  let changed = false;
+  const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
+
+  for (const mapping of targets) {
+    try {
+      const result = await ensureBlueskyBotSelfLabel({
+        bskyIdentifier: mapping.bskyIdentifier,
+        bskyPassword: mapping.bskyPassword,
+        bskyServiceUrl: mapping.bskyServiceUrl,
+      });
+
+      if (result.updated) {
+        labeled += 1;
+      } else {
+        alreadyLabeled += 1;
+      }
+
+      if (!mapping.hasBotLabel) {
+        mapping.hasBotLabel = true;
+        changed = true;
+      }
+
+      for (const key of [
+        normalizeActor(mapping.bskyIdentifier),
+        normalizeActor(result.bsky.handle),
+        normalizeActor(result.bsky.did),
+      ]) {
+        if (key) {
+          profileCache.delete(key);
+        }
+      }
+    } catch (error) {
+      failed += 1;
+      failedMappings.push({
+        id: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        error: getErrorMessage(error, 'Failed to update bot label.'),
+      });
+    }
+  }
+
+  if (changed) {
+    saveConfig(config);
+  }
+
+  res.json({
+    success: true,
+    total: targets.length,
+    labeled,
+    alreadyLabeled,
+    failed,
+    failedMappings,
+    mappings: targets.map((mapping) => sanitizeMapping(mapping, usersById, req.user)),
+  });
+});
+
+app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any, res) => {
+  if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to update mappings.' });
+    return;
+  }
+
+  const config = getConfig();
+  const usersById = createUserLookupById(config);
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const requestedIds = parseMappingIds(req.body?.mappingIds);
+  const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
+  const targets = requestedIdSet
+    ? manageableMappings.filter((mapping) => requestedIdSet.has(mapping.id))
+    : manageableMappings;
+
+  if (targets.length === 0) {
+    res.status(400).json({ error: 'No manageable mappings available for display-name update.' });
+    return;
+  }
+
+  let appended = 0;
+  let alreadyAppended = 0;
+  let failed = 0;
+  let changed = false;
+  const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
+
+  for (const mapping of targets) {
+    try {
+      const sourceTwitterUsername = resolveProfileSyncSourceUsername({
+        twitterUsernames: mapping.twitterUsernames,
+        fallbackSource: mapping.profileSyncSourceUsername,
+      });
+      if (!sourceTwitterUsername) {
+        failed += 1;
+        failedMappings.push({
+          id: mapping.id,
+          bskyIdentifier: mapping.bskyIdentifier,
+          error: 'Mapping has no Twitter source usernames.',
+        });
+        continue;
+      }
+
+      const result = await ensureBlueskyDisplayNameBotSuffix({
+        bskyIdentifier: mapping.bskyIdentifier,
+        bskyPassword: mapping.bskyPassword,
+        bskyServiceUrl: mapping.bskyServiceUrl,
+        twitterUsername: sourceTwitterUsername,
+      });
+
+      if (result.updated) {
+        appended += 1;
+      } else {
+        alreadyAppended += 1;
+      }
+
+      if (mapping.profileSyncSourceUsername !== sourceTwitterUsername) {
+        mapping.profileSyncSourceUsername = sourceTwitterUsername;
+        changed = true;
+      }
+
+      if (mapping.lastMirroredDisplayName !== result.displayName) {
+        mapping.lastMirroredDisplayName = result.displayName;
+        changed = true;
+      }
+
+      for (const key of [
+        normalizeActor(mapping.bskyIdentifier),
+        normalizeActor(result.bsky.handle),
+        normalizeActor(result.bsky.did),
+      ]) {
+        if (key) {
+          profileCache.delete(key);
+        }
+      }
+    } catch (error) {
+      failed += 1;
+      failedMappings.push({
+        id: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        error: getErrorMessage(error, 'Failed to append display-name suffix.'),
+      });
+    }
+  }
+
+  if (changed) {
+    saveConfig(config);
+  }
+
+  res.json({
+    success: true,
+    total: targets.length,
+    appended,
+    alreadyAppended,
+    failed,
+    failedMappings,
+    mappings: targets.map((mapping) => sanitizeMapping(mapping, usersById, req.user)),
+  });
 });
 
 app.post('/api/mappings/:id/bridge-to-fediverse', authenticateToken, async (req: any, res) => {

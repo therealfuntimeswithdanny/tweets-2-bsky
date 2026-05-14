@@ -1,12 +1,33 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import {
+  ACTIVE_CONFIG_FILE,
+  LEGACY_CONFIG_FILE,
+  USING_EXTERNAL_DATA_DIR,
+} from './storage-paths.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const CONFIG_FILE = ACTIVE_CONFIG_FILE;
+let configPathInitialized = false;
 
-const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
+function ensureConfigPathReady(): void {
+  if (configPathInitialized) {
+    return;
+  }
+  configPathInitialized = true;
+
+  if (!USING_EXTERNAL_DATA_DIR || fs.existsSync(CONFIG_FILE) || !fs.existsSync(LEGACY_CONFIG_FILE)) {
+    return;
+  }
+
+  try {
+    fs.copyFileSync(LEGACY_CONFIG_FILE, CONFIG_FILE);
+    console.log(`📦 Migrated config from ${LEGACY_CONFIG_FILE} to ${CONFIG_FILE}.`);
+  } catch (error) {
+    console.warn(
+      `⚠️ Failed to migrate legacy config from ${LEGACY_CONFIG_FILE} to ${CONFIG_FILE}: ${(error as Error).message}`,
+    );
+  }
+}
 
 export interface TwitterConfig {
   authToken: string;
@@ -61,6 +82,7 @@ export interface AccountMapping {
   lastMirroredDescription?: string;
   lastMirroredAvatarUrl?: string;
   lastMirroredBannerUrl?: string;
+  hasBotLabel?: boolean;
 }
 
 export interface AccountGroup {
@@ -313,6 +335,7 @@ const normalizeMapping = (rawMapping: unknown, users: WebUser[], adminUserId?: s
     lastMirroredDescription: normalizeString(record.lastMirroredDescription),
     lastMirroredAvatarUrl: normalizeString(record.lastMirroredAvatarUrl),
     lastMirroredBannerUrl: normalizeString(record.lastMirroredBannerUrl),
+    hasBotLabel: normalizeBoolean(record.hasBotLabel, false),
     createdByUserId:
       (explicitCreatorExists ? explicitCreator : undefined) ?? matchOwnerToUserId(owner, users) ?? adminUserId,
   };
@@ -432,6 +455,8 @@ const writeConfigFile = (config: AppConfig) => {
 };
 
 export function getConfig(): AppConfig {
+  ensureConfigPathReady();
+
   if (!fs.existsSync(CONFIG_FILE)) {
     return { ...DEFAULT_CONFIG };
   }
@@ -453,6 +478,8 @@ export function getConfig(): AppConfig {
 }
 
 export function saveConfig(config: AppConfig): void {
+  ensureConfigPathReady();
+
   const normalizedConfig = normalizeConfigShape(config);
   writeConfigFile(normalizedConfig);
 }
