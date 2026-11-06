@@ -1,16 +1,25 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
+import sharp from 'sharp';
 import { getConfig } from './config-manager.js';
 
-export async function generateAltText(
-  buffer: Buffer,
-  mimeType: string,
-  contextText: string,
-): Promise<string | undefined> {
-  const config = getConfig();
+// claude-3-5-sonnet-20241022, the previous default, is retired: every call to
+// it failed and alt text went silently missing. Set `model` in the AI settings
+// to use a different (e.g. cheaper) Claude model.
+export const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5';
 
-  // 1. Determine Provider and Credentials
-  // Priority: AI Config > Legacy Gemini Config > Environment Variables
+interface ResolvedAiProvider {
+  provider: 'gemini' | 'openai' | 'anthropic' | 'custom';
+  apiKey?: string;
+  model?: string;
+  baseUrl?: string;
+}
+
+// Determine Provider and Credentials.
+// Priority: AI Config > Legacy Gemini Config > Environment Variables.
+// Returns null when alt-text generation is effectively disabled (no usable credentials).
+function resolveAiProvider(): ResolvedAiProvider | null {
+  const config = getConfig();
 
   const provider = config.ai?.provider || 'gemini';
   let apiKey = config.ai?.apiKey;
@@ -25,25 +34,55 @@ export async function generateAltText(
     else if (provider === 'anthropic') apiKey = process.env.ANTHROPIC_API_KEY;
   }
 
-  // Fallback for Gemini specific legacy env var if provider is implicitly gemini
-  if (!apiKey && provider === 'gemini') {
-    apiKey = process.env.GEMINI_API_KEY;
-  }
-
   // API Key is mandatory for Gemini and Anthropic
   if (!apiKey && (provider === 'gemini' || provider === 'anthropic')) {
-    return undefined;
+    return null;
+  }
+
+  // OpenAI without a key only makes sense against a custom base URL (e.g. a
+  // local server); against api.openai.com it would fail on every image.
+  if (provider === 'openai' && !apiKey && !baseUrl) {
+    return null;
+  }
+
+  // Custom providers need at least a base URL to call.
+  if (provider === 'custom' && !baseUrl) {
+    return null;
   }
 
   // Default Models
   if (!model) {
     if (provider === 'gemini') model = 'models/gemini-2.5-flash';
     else if (provider === 'openai') model = 'gpt-4o';
-    else if (provider === 'anthropic') model = 'claude-3-5-sonnet-20241022';
+    else if (provider === 'anthropic') model = DEFAULT_ANTHROPIC_MODEL;
   }
+
+  return { provider, apiKey, model, baseUrl };
+}
+
+// Whether alt-text generation is configured/enabled at all. Many instances
+// run without it; callers should skip the generation step entirely when false.
+export function isAltTextConfigured(): boolean {
+  return resolveAiProvider() !== null;
+}
+
+export async function generateAltText(
+  originalBuffer: Buffer,
+  originalMimeType: string,
+  contextText: string,
+): Promise<string | undefined> {
+  const resolved = resolveAiProvider();
+  if (!resolved) {
+    return undefined;
+  }
+  const { provider, apiKey, model, baseUrl } = resolved;
 
   try {
     const prompt = buildAltTextPrompt(contextText);
+    // Full-resolution originals routinely exceed the providers' image limits
+    // (Anthropic rejects anything over 5MB), which failed the request and left
+    // the image without alt text. Vision models see no more detail than this.
+    const { buffer, mimeType } = await prepareImageForVision(originalBuffer, originalMimeType);
     switch (provider) {
       case 'gemini':
         // apiKey is guaranteed by check above
@@ -58,14 +97,7 @@ export async function generateAltText(
       case 'anthropic':
         // apiKey is guaranteed by check above
         return normalizeAltTextOutput(
-          await callAnthropic(
-            apiKey!,
-            model || 'claude-3-5-sonnet-20241022',
-            baseUrl,
-            buffer,
-            mimeType,
-            prompt,
-          ),
+          await callAnthropic(apiKey!, model || DEFAULT_ANTHROPIC_MODEL, baseUrl, buffer, mimeType, prompt),
         );
       default:
         console.warn(`[AI] ⚠️ Unknown provider: ${provider}`);
@@ -127,7 +159,7 @@ async function callGemini(
   prompt: string,
 ): Promise<string | undefined> {
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: modelName });
+  const model = genAI.getGenerativeModel({ model: modelName }, { timeout: 60_000 });
 
   const result = await model.generateContent([
     prompt,
@@ -183,7 +215,7 @@ async function callOpenAICompatible(
   };
 
   if (apiKey) {
-    headers['Authorization'] = `Bearer ${apiKey}`;
+    headers.Authorization = `Bearer ${apiKey}`;
   }
 
   // OpenRouter specific headers (optional but good practice)
@@ -192,7 +224,7 @@ async function callOpenAICompatible(
     headers['X-Title'] = 'Tweets to Bluesky';
   }
 
-  const response = await axios.post(url, payload, { headers });
+  const response = await axios.post(url, payload, { headers, timeout: 60_000 });
 
   return response.data.choices[0]?.message?.content || undefined;
 }
@@ -209,9 +241,14 @@ async function callAnthropic(
 
   const base64Data = buffer.toString('base64');
 
-  const payload = {
+  // biome-ignore lint/suspicious/noExplicitAny: raw Messages API payload
+  const payload: Record<string, any> = {
     model: model,
-    max_tokens: 300,
+    // Current models think before answering and that counts towards
+    // max_tokens; 300 left no room for the description itself.
+    max_tokens: 2048,
+    // A one-sentence description does not need deep reasoning.
+    output_config: { effort: 'low' },
     messages: [
       {
         role: 'user',
@@ -233,13 +270,58 @@ async function callAnthropic(
     ],
   };
 
-  const response = await axios.post(url, payload, {
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json',
-    },
-  });
+  const headers: Record<string, string> = {
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+    'Content-Type': 'application/json',
+  };
 
-  return response.data.content[0]?.text || undefined;
+  // On the first-party API, a safety-classifier decline is retried on a
+  // fallback model inside the same call instead of costing the image its alt
+  // text. Left off for a custom base URL: proxies and partner platforms do not
+  // accept the parameter.
+  if (!baseUrl) {
+    payload.fallbacks = 'default';
+    headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+  }
+
+  const response = await axios.post(url, payload, { headers, timeout: 60_000 });
+
+  if (response.data?.stop_reason === 'refusal') return undefined;
+  // The first content block is a thinking block on current models, so find
+  // the text rather than reading content[0].
+  const content: { type?: string; text?: string }[] = Array.isArray(response.data?.content)
+    ? response.data.content
+    : [];
+  return content.find((block) => block.type === 'text' && typeof block.text === 'string')?.text || undefined;
+}
+
+// Longest edge vision models make use of; Anthropic downscales anything larger.
+const VISION_MAX_EDGE = 1568;
+// Stay well under Anthropic's 5MB per-image limit after base64 inflation.
+const VISION_MAX_BYTES = 3.5 * 1024 * 1024;
+const VISION_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+/** Shrink an image to what vision models accept and actually use. */
+export async function prepareImageForVision(
+  buffer: Buffer,
+  mimeType: string,
+): Promise<{ buffer: Buffer; mimeType: string }> {
+  try {
+    const metadata = await sharp(buffer, { failOn: 'none' }).metadata();
+    const longEdge = Math.max(metadata.width ?? 0, metadata.height ?? 0);
+    const supported = VISION_MIME_TYPES.has(mimeType);
+    if (supported && longEdge <= VISION_MAX_EDGE && buffer.length <= VISION_MAX_BYTES) {
+      return { buffer, mimeType };
+    }
+    const resized = await sharp(buffer, { failOn: 'none' })
+      .rotate()
+      .resize({ width: VISION_MAX_EDGE, height: VISION_MAX_EDGE, fit: 'inside', withoutEnlargement: true })
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    return { buffer: resized, mimeType: 'image/jpeg' };
+  } catch {
+    return { buffer, mimeType };
+  }
 }

@@ -8,7 +8,8 @@ import bcrypt from 'bcryptjs';
 import cors from 'cors';
 import express from 'express';
 import jwt, { type SignOptions } from 'jsonwebtoken';
-import { deleteAllPosts } from './bsky.js';
+import { type DeletePostsScope, deletePosts } from './bsky.js';
+import { normalizeSensitiveFallbackLabel } from './compose.js';
 import {
   ADMIN_USER_PERMISSIONS,
   type AccountMapping,
@@ -19,9 +20,16 @@ import {
   getConfig,
   getDefaultUserPermissions,
   saveConfig,
+  updateConfig,
+  updateMappingById,
 } from './config-manager.js';
-import { dbService } from './db.js';
+import { accountHealthService, dbService, postQueueService, sourceActivityService } from './db.js';
 import type { ProcessedTweet } from './db.js';
+import { syncDiscoveryForGroup } from './discovery-runner.js';
+import type { LogExportFormat, LogLevel, LogQueryFilters, LogStage } from './event-log.js';
+import { eventLogService, exportLogs, logEvent } from './event-log.js';
+import { activityFromRow, decideCheck } from './polling.js';
+import { isPreviewAvailable, runPreview } from './preview.js';
 import {
   applyProfileMirrorSyncState,
   bridgeBlueskyAccountToFediverse,
@@ -253,12 +261,18 @@ interface RateLimitBucket {
 
 const authRateBuckets = new Map<string, RateLimitBucket>();
 
+// Only honor X-Forwarded-For when explicitly running behind a trusted reverse
+// proxy; otherwise clients could spoof the header to bypass auth rate limiting.
+const TRUST_PROXY = ['1', 'true', 'yes'].includes((process.env.TRUST_PROXY || '').trim().toLowerCase());
+
 const getRequestIp = (req: any): string => {
-  const forwarded = req.headers?.['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim().length > 0) {
-    const [first] = forwarded.split(',');
-    if (first && first.trim().length > 0) {
-      return first.trim();
+  if (TRUST_PROXY) {
+    const forwarded = req.headers?.['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim().length > 0) {
+      const [first] = forwarded.split(',');
+      if (first && first.trim().length > 0) {
+        return first.trim();
+      }
     }
   }
   if (typeof req.ip === 'string' && req.ip.length > 0) {
@@ -848,6 +862,65 @@ let pendingBackfills: PendingBackfill[] = [];
 let backfillSequence = 0;
 let schedulerWakeSignal = 0; // Monotonic counter to wake scheduler loop immediately.
 
+// Multiple subbranches work in parallel, so a single global status message
+// gets clobbered constantly. Each unit of work registers its own job here and
+// the dashboard renders the full list.
+export type ActiveJobKind = 'checking' | 'mirroring' | 'backfilling' | 'profile-sync' | 'pin-sync';
+
+export interface ActiveJob {
+  id: string;
+  kind: ActiveJobKind;
+  account?: string;
+  target?: string;
+  mappingId?: string;
+  message?: string;
+  processedCount?: number;
+  totalCount?: number;
+  startedAt: number;
+  updatedAt: number;
+}
+
+const activeJobs = new Map<string, ActiveJob>();
+const JOB_STALE_MS = 30 * 60 * 1000;
+
+export function updateJob(id: string, patch: Partial<Omit<ActiveJob, 'id' | 'startedAt' | 'updatedAt'>> | null): void {
+  if (patch === null) {
+    activeJobs.delete(id);
+    return;
+  }
+  const existing = activeJobs.get(id);
+  activeJobs.set(id, {
+    kind: 'checking',
+    ...existing,
+    ...patch,
+    id,
+    startedAt: existing?.startedAt ?? Date.now(),
+    updatedAt: Date.now(),
+  });
+}
+
+function getActiveJobsSnapshot(): ActiveJob[] {
+  const now = Date.now();
+  for (const [id, job] of activeJobs) {
+    // A crashed/abandoned task should not leave a ghost job on the dashboard.
+    if (now - job.updatedAt > JOB_STALE_MS) activeJobs.delete(id);
+  }
+  return [...activeJobs.values()].sort((a, b) => a.startedAt - b.startedAt);
+}
+
+export interface PendingPinSync {
+  id: string;
+  queuedAt: number;
+  requestId: string;
+}
+let pendingPinSyncs: PendingPinSync[] = [];
+
+export const getPendingPinSyncs = (): PendingPinSync[] => [...pendingPinSyncs];
+
+export const clearPinSync = (id: string): void => {
+  pendingPinSyncs = pendingPinSyncs.filter((entry) => entry.id !== id);
+};
+
 interface AppStatus {
   state: 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
   currentAccount?: string;
@@ -872,10 +945,35 @@ function signalSchedulerWake(): void {
   schedulerWakeSignal += 1;
 }
 
-function requestImmediateSchedulerPass(): void {
+// "Run now" forces a check that adaptive polling would otherwise skip. A
+// whole-instance force is one timeline request per source account, so it is
+// throttled: repeated clicks inside the cooldown run a normal sweep instead.
+// Forcing a single account is cheap and is never throttled.
+const FORCE_ALL_COOLDOWN_MS = 5 * 60 * 1000;
+let lastForcedAllAt = 0;
+let pendingForce: { all: boolean; mappingIds: Set<string> } = { all: false, mappingIds: new Set() };
+
+function requestImmediateSchedulerPass(options: { mappingId?: string } = {}): { forced: 'all' | 'mapping' | 'none' } {
   lastCheckTime = 0;
   nextCheckTime = Date.now() + 250;
+  let forced: 'all' | 'mapping' | 'none' = 'none';
+  if (options.mappingId) {
+    pendingForce.mappingIds.add(options.mappingId);
+    forced = 'mapping';
+  } else if (Date.now() - lastForcedAllAt >= FORCE_ALL_COOLDOWN_MS) {
+    pendingForce.all = true;
+    lastForcedAllAt = Date.now();
+    forced = 'all';
+  }
   signalSchedulerWake();
+  return { forced };
+}
+
+/** Consumed by the scheduler: which accounts the next sweep must check regardless of tier. */
+export function takeForcedSweep(): { all: boolean; mappingIds: Set<string> } {
+  const taken = pendingForce;
+  pendingForce = { all: false, mappingIds: new Set() };
+  return taken;
 }
 
 if (allowedOrigins.size === 0) {
@@ -893,7 +991,8 @@ if (allowedOrigins.size === 0) {
     }),
   );
 }
-app.use(express.json());
+// Config imports with many mappings can exceed the 100kb express default.
+app.use(express.json({ limit: '2mb' }));
 
 app.use(
   express.static(staticAssetsDir, {
@@ -1169,6 +1268,51 @@ const sanitizeMapping = (
 
   return response;
 };
+
+type MappingSettings = Pick<
+  AccountMapping,
+  | 'sensitiveFallbackLabel'
+  | 'editMode'
+  | 'mirrorRetweets'
+  | 'mirrorRepliesToMirrors'
+  | 'botDisplayNameSuffix'
+  | 'syncDeletes'
+>;
+
+/** The per-mapping mirroring settings present in a request body, validated. */
+const parseMappingSettings = (body: Record<string, unknown> | undefined): Partial<MappingSettings> => {
+  const settings: Partial<MappingSettings> = {};
+  if (!body) return settings;
+  if (body.sensitiveFallbackLabel !== undefined) {
+    settings.sensitiveFallbackLabel = normalizeSensitiveFallbackLabel(body.sensitiveFallbackLabel);
+  }
+  if (body.editMode === 'skip' || body.editMode === 'replace') settings.editMode = body.editMode;
+  for (const key of ['mirrorRetweets', 'mirrorRepliesToMirrors', 'botDisplayNameSuffix', 'syncDeletes'] as const) {
+    if (typeof body[key] === 'boolean') settings[key] = body[key] as boolean;
+  }
+  return settings;
+};
+
+/**
+ * DID behind a handle, via the public API, or null when it cannot be told.
+ * Used to decide whether an edited identifier is the same account under a new
+ * handle (history must follow it) or a different account (it must not).
+ */
+async function resolvePublicDid(identifier: string): Promise<string | null> {
+  const value = identifier.trim().toLowerCase();
+  if (value.startsWith('did:')) return value;
+  if (!value.includes('.') || value.includes('@')) return null;
+  try {
+    const response = await axios.get(`${BSKY_APPVIEW_URL}/xrpc/com.atproto.identity.resolveHandle`, {
+      params: { handle: value },
+      timeout: 8_000,
+    });
+    const did = response.data?.did;
+    return typeof did === 'string' && did.startsWith('did:') ? did : null;
+  } catch {
+    return null;
+  }
+}
 
 const parseTwitterUsernames = (value: unknown): string[] => {
   const seen = new Set<string>();
@@ -1963,13 +2107,20 @@ app.put('/api/groups/:groupKey', authenticateToken, (req: any, res) => {
     finalName = normalizeGroupName(config.groups[mergeIndex]?.name) || requestedName;
     finalEmoji = requestedEmoji || normalizeGroupEmoji(config.groups[mergeIndex]?.emoji) || finalEmoji;
 
+    // Keep the surviving group's Bluesky list and starter pack: rebuilding the
+    // object from name and emoji alone orphaned them, and the next sync then
+    // created duplicates.
+    const { emoji: _mergeEmoji, ...mergeRest } = config.groups[mergeIndex] ?? { name: finalName };
     config.groups[mergeIndex] = {
+      ...mergeRest,
       name: finalName,
       ...(finalEmoji ? { emoji: finalEmoji } : {}),
     };
     config.groups.splice(groupIndex, 1);
   } else {
+    const { emoji: _previousEmoji, ...rest } = config.groups[groupIndex] ?? { name: finalName };
     config.groups[groupIndex] = {
+      ...rest,
       name: finalName,
       ...(finalEmoji ? { emoji: finalEmoji } : {}),
     };
@@ -2142,6 +2293,11 @@ app.post('/api/mappings', authenticateToken, async (req: any, res) => {
     createdByUserId,
     profileSyncSourceUsername,
     hasBotLabel: false,
+    ...parseMappingSettings(req.body),
+    // "Only new tweets" (the dashboard default) records what is already on the
+    // timeline as history instead of posting it. `recent` keeps the old
+    // behaviour of mirroring the latest tweets straight away.
+    ...(req.body?.startFrom === 'now' ? { mirrorFromMs: Date.now() } : {}),
   };
 
   ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
@@ -2157,7 +2313,13 @@ app.post('/api/mappings', authenticateToken, async (req: any, res) => {
 
     if (labelResult.hasBotLabel && !newMapping.hasBotLabel) {
       newMapping.hasBotLabel = true;
-      saveConfig(config);
+      // Fresh read: the login above took time, and saving the snapshot from
+      // before it would revert anything written meanwhile.
+      updateMappingById(newMapping.id, (entry) => {
+        entry.hasBotLabel = true;
+        if (labelResult.bsky.did?.startsWith('did:')) entry.bskyDid = labelResult.bsky.did;
+        return true;
+      });
     }
 
     for (const key of [
@@ -2175,10 +2337,10 @@ app.post('/api/mappings', authenticateToken, async (req: any, res) => {
     );
   }
 
-  res.json(sanitizeMapping(newMapping, createUserLookupById(config), req.user));
+  res.json(sanitizeMapping(newMapping, createUserLookupById(getConfig()), req.user));
 });
 
-app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
+app.put('/api/mappings/:id', authenticateToken, async (req: any, res) => {
   const { id } = req.params;
   const config = getConfig();
   const usersById = createUserLookupById(config);
@@ -2253,23 +2415,104 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
     fallbackSource: existingMapping.profileSyncSourceUsername,
   });
 
-  const updatedMapping: AccountMapping = {
-    ...existingMapping,
+  const patch: Partial<AccountMapping> = {
     twitterUsernames,
     bskyIdentifier,
     bskyPassword: normalizeOptionalString(req.body?.bskyPassword) || existingMapping.bskyPassword,
     bskyServiceUrl: normalizeOptionalString(req.body?.bskyServiceUrl) || existingMapping.bskyServiceUrl,
+    enabled: normalizeBoolean(req.body?.enabled, existingMapping.enabled),
     owner,
     groupName: nextGroupName,
     groupEmoji: nextGroupEmoji,
     createdByUserId,
     profileSyncSourceUsername,
+    ...parseMappingSettings(req.body),
   };
 
-  ensureGroupExists(config, nextGroupName, nextGroupEmoji);
-  config.mappings[index] = updatedMapping;
-  saveConfig(config);
-  res.json(sanitizeMapping(updatedMapping, createUserLookupById(config), req.user));
+  // History, the queue and account health are keyed by the identifier. A new
+  // handle for the same account must take them along — otherwise the next
+  // sweep sees no history and re-posts the latest tweets. A different account
+  // must not inherit them. The DID tells the two apart.
+  const identifierChanged = bskyIdentifier.toLowerCase() !== existingMapping.bskyIdentifier.toLowerCase();
+  let moveHistory = false;
+  if (identifierChanged) {
+    const newDid = await resolvePublicDid(bskyIdentifier);
+    const oldDid = existingMapping.bskyDid ?? (await resolvePublicDid(existingMapping.bskyIdentifier));
+    // Unknown on either side: assume the same account. Wrongly moving history
+    // skips a few tweets on a new account; wrongly not moving it duplicates
+    // the latest 50 posts on the existing one.
+    moveHistory = !newDid || !oldDid || newDid === oldDid;
+    patch.bskyDid = moveHistory ? (existingMapping.bskyDid ?? newDid ?? undefined) : (newDid ?? undefined);
+  }
+
+  if (moveHistory) {
+    const moved = dbService.migrateBskyIdentifier(existingMapping.bskyIdentifier, bskyIdentifier);
+    logEvent({
+      level: 'info',
+      stage: 'system',
+      event: 'account.identifier-moved',
+      message: `${existingMapping.bskyIdentifier} was renamed to ${bskyIdentifier}; moved ${moved.history} history record(s) and ${moved.queue} queued tweet(s).`,
+      mappingId: id,
+      bskyIdentifier,
+      detail: moved,
+    });
+  }
+
+  let updatedMapping: AccountMapping | undefined;
+  updateConfig((fresh) => {
+    const target = fresh.mappings.find((mapping) => mapping.id === id);
+    if (!target) return false;
+    Object.assign(target, patch);
+    ensureGroupExists(fresh, nextGroupName, nextGroupEmoji);
+    updatedMapping = target;
+    return true;
+  });
+  if (!updatedMapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+  res.json(sanitizeMapping(updatedMapping, createUserLookupById(getConfig()), req.user));
+});
+
+// Forces the next login attempt for a down account to happen immediately,
+// instead of waiting out the escalating recheck schedule. This is the
+// dashboard's "Check again" button: the only thing to do after reactivating an
+// account or winning a takedown appeal.
+app.post('/api/mappings/:id/recheck-account', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const mapping = config.mappings.find((entry) => entry.id === req.params.id);
+
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have permission to update this mapping.' });
+    return;
+  }
+
+  const health = accountHealthService.get(mapping.bskyIdentifier);
+  if (!health) {
+    res.json({ ok: true, cleared: false, message: `${mapping.bskyIdentifier} is not currently flagged as down.` });
+    return;
+  }
+
+  accountHealthService.recheckNow(mapping.bskyIdentifier);
+  logEvent({
+    level: 'info',
+    stage: 'bluesky',
+    event: 'account.recheck-requested',
+    message: `Manual recheck requested for ${mapping.bskyIdentifier}; the next post batch will attempt a fresh sign-in.`,
+    mappingId: mapping.id,
+    bskyIdentifier: mapping.bskyIdentifier,
+    detail: { state: health.state, detectedAt: health.detected_at },
+  });
+
+  res.json({
+    ok: true,
+    cleared: true,
+    message: `Will retry ${mapping.bskyIdentifier} on the next post batch.`,
+  });
 });
 
 app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async (req: any, res) => {
@@ -2306,11 +2549,15 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
       bskyPassword: mapping.bskyPassword,
       bskyServiceUrl: mapping.bskyServiceUrl,
       previousSync: getMappingMirrorSyncState(mapping),
+      botDisplayNameSuffix: mapping.botDisplayNameSuffix !== false,
     });
 
-    const updatedMapping = applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
-    config.mappings[mappingIndex] = updatedMapping;
-    saveConfig(config);
+    // Patch a fresh read: the sync above takes seconds, and saving the config
+    // loaded before it would revert everything written meanwhile.
+    const updatedMapping =
+      updateMappingById(mapping.id, (entry) => {
+        Object.assign(entry, applyProfileMirrorSyncState(entry, sourceTwitterUsername, result));
+      }) ?? applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
 
     for (const key of [
       normalizeActor(updatedMapping.bskyIdentifier),
@@ -2325,7 +2572,7 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
     res.json({
       success: true,
       sourceTwitterUsername,
-      mapping: sanitizeMapping(updatedMapping, createUserLookupById(config), req.user),
+      mapping: sanitizeMapping(updatedMapping, createUserLookupById(getConfig()), req.user),
       ...result,
     });
   } catch (error) {
@@ -2371,11 +2618,15 @@ app.post('/api/mappings/:id/pull-twitter-bio', authenticateToken, async (req: an
       syncDescription: true,
       syncAvatar: false,
       syncBanner: false,
+      syncWebsite: false,
+      // An explicit "pull bio" replaces the Bluesky bio even if edited by hand.
+      forceDescription: true,
     });
 
-    const updatedMapping = applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
-    config.mappings[mappingIndex] = updatedMapping;
-    saveConfig(config);
+    const updatedMapping =
+      updateMappingById(mapping.id, (entry) => {
+        Object.assign(entry, applyProfileMirrorSyncState(entry, sourceTwitterUsername, result));
+      }) ?? applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
 
     for (const key of [
       normalizeActor(updatedMapping.bskyIdentifier),
@@ -2390,7 +2641,7 @@ app.post('/api/mappings/:id/pull-twitter-bio', authenticateToken, async (req: an
     res.json({
       success: true,
       sourceTwitterUsername,
-      mapping: sanitizeMapping(updatedMapping, createUserLookupById(config), req.user),
+      mapping: sanitizeMapping(updatedMapping, createUserLookupById(getConfig()), req.user),
       ...result,
     });
   } catch (error) {
@@ -2406,7 +2657,9 @@ app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res)
 
   const config = getConfig();
   const usersById = createUserLookupById(config);
-  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) =>
+    canManageMapping(req.user, mapping),
+  );
   const requestedIds = parseMappingIds(req.body?.mappingIds);
   const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
   const targets = requestedIdSet
@@ -2422,6 +2675,7 @@ app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res)
   let alreadyLabeled = 0;
   let failed = 0;
   let changed = false;
+  const changedIds = new Set<string>();
   const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
 
   for (const mapping of targets) {
@@ -2440,6 +2694,7 @@ app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res)
 
       if (!mapping.hasBotLabel) {
         mapping.hasBotLabel = true;
+        changedIds.add(mapping.id);
         changed = true;
       }
 
@@ -2463,7 +2718,15 @@ app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res)
   }
 
   if (changed) {
-    saveConfig(config);
+    // This loop logs in to every account in turn and can run for minutes.
+    // Patch only the flag on a fresh read; saving the snapshot taken before
+    // the loop would revert every other change made while it ran.
+    updateConfig((fresh) => {
+      for (const entry of fresh.mappings) {
+        if (changedIds.has(entry.id)) entry.hasBotLabel = true;
+      }
+      return true;
+    });
   }
 
   res.json({
@@ -2485,7 +2748,9 @@ app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any
 
   const config = getConfig();
   const usersById = createUserLookupById(config);
-  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) =>
+    canManageMapping(req.user, mapping),
+  );
   const requestedIds = parseMappingIds(req.body?.mappingIds);
   const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
   const targets = requestedIdSet
@@ -2501,6 +2766,7 @@ app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any
   let alreadyAppended = 0;
   let failed = 0;
   let changed = false;
+  const namePatches = new Map<string, Partial<AccountMapping>>();
   const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
 
   for (const mapping of targets) {
@@ -2524,6 +2790,7 @@ app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any
         bskyPassword: mapping.bskyPassword,
         bskyServiceUrl: mapping.bskyServiceUrl,
         twitterUsername: sourceTwitterUsername,
+        botDisplayNameSuffix: true,
       });
 
       if (result.updated) {
@@ -2541,6 +2808,16 @@ app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any
         mapping.lastMirroredDisplayName = result.displayName;
         changed = true;
       }
+      // Asking for the suffix turns the setting back on for this mapping.
+      if (mapping.botDisplayNameSuffix === false) {
+        mapping.botDisplayNameSuffix = true;
+        changed = true;
+      }
+      namePatches.set(mapping.id, {
+        profileSyncSourceUsername: mapping.profileSyncSourceUsername,
+        lastMirroredDisplayName: mapping.lastMirroredDisplayName,
+        botDisplayNameSuffix: mapping.botDisplayNameSuffix,
+      });
 
       for (const key of [
         normalizeActor(mapping.bskyIdentifier),
@@ -2562,7 +2839,14 @@ app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any
   }
 
   if (changed) {
-    saveConfig(config);
+    // Same as bot-label-all: patch a fresh read, never the pre-loop snapshot.
+    updateConfig((fresh) => {
+      for (const entry of fresh.mappings) {
+        const patch = namePatches.get(entry.id);
+        if (patch) Object.assign(entry, patch);
+      }
+      return true;
+    });
   }
 
   res.json({
@@ -2692,6 +2976,7 @@ app.delete('/api/mappings/:id', authenticateToken, (req: any, res) => {
 
   config.mappings = config.mappings.filter((entry) => entry.id !== id);
   pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
+  postQueueService.deleteByMappingId(id);
   saveConfig(config);
   res.json({ success: true });
 });
@@ -2705,11 +2990,11 @@ app.delete('/api/mappings/:id/cache', authenticateToken, requireAdmin, (req, res
     return;
   }
 
-  for (const username of mapping.twitterUsernames) {
-    dbService.deleteTweetsByUsername(username);
-  }
+  // Only this mirror's history. Deleting by username used to wipe the same
+  // source's history for every other mapping that mirrors it too.
+  const cleared = dbService.deleteTweetsForMapping(mapping.bskyIdentifier, mapping.twitterUsernames);
 
-  res.json({ success: true, message: 'Cache cleared for all associated accounts' });
+  res.json({ success: true, cleared, message: `Cache cleared for ${mapping.bskyIdentifier} (${cleared} record(s)).` });
 });
 
 app.post('/api/mappings/:id/delete-all-posts', authenticateToken, requireAdmin, async (req, res) => {
@@ -2721,14 +3006,19 @@ app.post('/api/mappings/:id/delete-all-posts', authenticateToken, requireAdmin, 
     return;
   }
 
+  // Default: only what the mirror posted. `all` also removes posts written by
+  // hand on the account, and has to be asked for explicitly.
+  const scope: DeletePostsScope = req.body?.scope === 'all' ? 'all' : 'mirrored';
   try {
-    const deletedCount = await deleteAllPosts(id);
-
-    dbService.deleteTweetsByBskyIdentifier(mapping.bskyIdentifier);
-
+    const { deleted } = await deletePosts(id, scope);
     res.json({
       success: true,
-      message: `Deleted ${deletedCount} posts from ${mapping.bskyIdentifier} and cleared local cache.`,
+      deleted,
+      scope,
+      message:
+        scope === 'all'
+          ? `Deleted all ${deleted} posts from ${mapping.bskyIdentifier}. Only tweets posted from now on will be mirrored.`
+          : `Deleted ${deleted} mirrored posts from ${mapping.bskyIdentifier}. Posts written directly on Bluesky were kept, and only tweets posted from now on will be mirrored.`,
     });
   } catch (err) {
     console.error('Failed to delete all posts:', err);
@@ -2771,7 +3061,7 @@ app.post('/api/ai-config', authenticateToken, requireAdmin, (req, res) => {
     baseUrl: baseUrl || undefined,
   };
 
-  delete config.geminiApiKey;
+  config.geminiApiKey = undefined; // legacy field; dropped from config.json on save
 
   saveConfig(config);
   res.json({ success: true });
@@ -2799,17 +3089,715 @@ app.get('/api/status', authenticateToken, (req: any, res) => {
         }
       : currentAppStatus;
 
+  // Jobs are scoped like backfills: by mapping id when set, otherwise by the
+  // Bluesky target of a mapping the user can see.
+  const visibleBskyIdentifiers = new Set(
+    config.mappings
+      .filter((mapping) => visibleMappingIds.has(mapping.id))
+      .map((mapping) => mapping.bskyIdentifier.toLowerCase()),
+  );
+  const scopedJobs = getActiveJobsSnapshot().filter((job) => {
+    if (job.mappingId) return visibleMappingIds.has(job.mappingId);
+    if (job.target) return visibleBskyIdentifiers.has(job.target.toLowerCase());
+    return true;
+  });
+
+  // Post-queue state comes straight from SQLite, so what the dashboard shows
+  // is exactly what the workers will post — no in-memory drift.
+  const queueCounts = postQueueService.getCounts();
+  const scopedQueueMappings = queueCounts.perMapping.filter(
+    (entry) => visibleMappingIds.has(entry.mapping_id) && entry.pending + entry.processing + entry.failed > 0,
+  );
+  const queueSummary = {
+    pending: scopedQueueMappings.reduce((total, entry) => total + entry.pending, 0),
+    processing: scopedQueueMappings.reduce((total, entry) => total + entry.processing, 0),
+    failed: scopedQueueMappings.reduce((total, entry) => total + entry.failed, 0),
+    // `pending` split into what can post now and what is serving retry backoff,
+    // so a stuck-looking number is self-explanatory in the UI.
+    ready: scopedQueueMappings.reduce((total, entry) => total + (entry.ready ?? 0), 0),
+    backoff: scopedQueueMappings.reduce((total, entry) => total + (entry.backoff ?? 0), 0),
+    nextRetryAt: scopedQueueMappings.reduce<number | null>(
+      (soonest, entry) =>
+        entry.next_retry_at !== null &&
+        entry.next_retry_at !== undefined &&
+        (soonest === null || entry.next_retry_at < soonest)
+          ? entry.next_retry_at
+          : soonest,
+      null,
+    ),
+    oldestEnqueuedAt: scopedQueueMappings.reduce<number | null>(
+      (oldest, entry) =>
+        entry.oldest_enqueued_at !== null && (oldest === null || entry.oldest_enqueued_at < oldest)
+          ? entry.oldest_enqueued_at
+          : oldest,
+      null,
+    ),
+    perMapping: scopedQueueMappings,
+  };
+
+  // Accounts that cannot be posted to at all (taken down, suspended,
+  // deactivated). Surfaced here rather than only in the log because otherwise
+  // the queue just looks stuck for no visible reason.
+  // Keyed once rather than scanned per mapping: the dashboard polls this
+  // endpoint, and large instances have hundreds of mappings.
+  const downByIdentifier = new Map(accountHealthService.list().map((row) => [row.bsky_identifier, row]));
+  const queueByMappingId = new Map(queueCounts.perMapping.map((entry) => [entry.mapping_id, entry]));
+  const accountAlerts = config.mappings
+    .filter((mapping) => visibleMappingIds.has(mapping.id))
+    .flatMap((mapping) => {
+      const health = downByIdentifier.get(mapping.bskyIdentifier.toLowerCase());
+      if (!health) return [];
+      const queued = queueByMappingId.get(mapping.id);
+      return [
+        {
+          mappingId: mapping.id,
+          bskyIdentifier: mapping.bskyIdentifier,
+          twitterUsernames: mapping.twitterUsernames,
+          state: health.state,
+          status: health.status,
+          reason: health.reason,
+          detectedAt: health.detected_at,
+          lastCheckedAt: health.last_checked_at,
+          nextRecheckAt: health.next_recheck_at,
+          queuedTweets: (queued?.pending ?? 0) + (queued?.processing ?? 0),
+        },
+      ];
+    });
+
   res.json({
     lastCheckTime,
     nextCheckTime,
     nextCheckMinutes: Math.ceil(nextRunMs / 60000),
     checkIntervalMinutes: config.checkIntervalMinutes,
+    accountAlerts,
     pendingBackfills: scopedPendingBackfills.map((backfill, index) => ({
       ...backfill,
       position: index + 1,
     })),
     currentStatus: scopedStatus,
+    activeJobs: scopedJobs,
+    queue: queueSummary,
   });
+});
+
+// Detailed post-queue listing, scoped to the mappings the caller can see.
+app.get('/api/queue', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const visibleMappingIds = getVisibleMappingIdSet(config, req.user);
+  const limitRaw = Number(req.query.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 500)) : 200;
+
+  res.json({
+    counts: postQueueService.getCounts().perMapping.filter((entry) => visibleMappingIds.has(entry.mapping_id)),
+    items: postQueueService.listItems({ mappingIds: visibleMappingIds, limit }),
+  });
+});
+
+// Everything about one mirrored account in a single payload: its configuration,
+// outage state, mirror lag, queue, recent posts and recent log lines. The
+// dashboard's per-account page renders this, so managing an account does not
+// mean hopping between four tabs and reading the log.
+//
+// Read access follows the same visibility rule as the account list; every
+// mutating action below re-checks canManageMapping rather than trusting the
+// `permissions` block in this response, which exists only so the UI can hide
+// what the user cannot do.
+app.get('/api/accounts/:id', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const mapping = config.mappings.find((entry) => entry.id === req.params.id);
+  if (!mapping || !getVisibleMappingIdSet(config, req.user).has(mapping.id)) {
+    // Same answer for "does not exist" and "not yours", so this cannot be used
+    // to enumerate other people's mappings.
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+
+  const identifier = mapping.bskyIdentifier.toLowerCase();
+  const windowMs = 7 * 24 * 60 * 60 * 1000;
+  // Per-identifier queries rather than the whole-table aggregates the account
+  // list uses: this endpoint is polled every ten seconds by the detail page.
+  const lag = dbService.getMirrorLagForIdentifier(identifier, windowMs);
+  const posts = dbService.getPostStatsForIdentifier(identifier, windowMs);
+  const queueCounts = postQueueService.getCounts().perMapping.find((row) => row.mapping_id === mapping.id);
+  const health = accountHealthService.get(mapping.bskyIdentifier);
+  const activity = sourceActivityService.getAll();
+  const now = Date.now();
+
+  const canManage = canManageMapping(req.user, mapping);
+
+  res.json({
+    mapping: {
+      id: mapping.id,
+      bskyIdentifier: mapping.bskyIdentifier,
+      bskyServiceUrl: mapping.bskyServiceUrl,
+      twitterUsernames: mapping.twitterUsernames,
+      enabled: mapping.enabled,
+      owner: mapping.owner,
+      groupName: mapping.groupName,
+      groupEmoji: mapping.groupEmoji,
+      hasBotLabel: mapping.hasBotLabel,
+      profileSyncSourceUsername: mapping.profileSyncSourceUsername,
+      lastProfileSyncAt: mapping.lastProfileSyncAt,
+      lastPinnedTweetId: mapping.lastPinnedTweetId,
+      lastPinSyncAt: mapping.lastPinSyncAt,
+      bskyDid: mapping.bskyDid,
+      mirrorFromMs: mapping.mirrorFromMs,
+      sensitiveFallbackLabel: mapping.sensitiveFallbackLabel ?? 'sexual',
+      editMode: mapping.editMode ?? 'skip',
+      mirrorRetweets: mapping.mirrorRetweets !== false,
+      mirrorRepliesToMirrors: mapping.mirrorRepliesToMirrors !== false,
+      botDisplayNameSuffix: mapping.botDisplayNameSuffix !== false,
+      syncDeletes: mapping.syncDeletes === true,
+      // Deliberately absent: bskyPassword.
+    },
+    permissions: {
+      canManage,
+      canQueueBackfills: canManage && canQueueBackfills(req.user),
+      canRunNow: canRunNow(req.user),
+      isAdmin: isActorAdmin(req.user),
+    },
+    down: health
+      ? {
+          state: health.state,
+          status: health.status,
+          reason: health.reason,
+          detectedAt: health.detected_at,
+          lastCheckedAt: health.last_checked_at,
+          nextRecheckAt: health.next_recheck_at,
+          checks: health.checks,
+        }
+      : null,
+    lag: lag
+      ? {
+          samples: lag.samples,
+          averageMs: lag.averageLagMs,
+          medianMs: lag.medianLagMs,
+          p95Ms: lag.p95LagMs,
+          worstMs: lag.worstLagMs,
+        }
+      : null,
+    posts: {
+      posted: posts?.posted ?? 0,
+      skipped: posts?.skipped ?? 0,
+      failed: posts?.failed ?? 0,
+      lastPostedAt: posts?.last_posted_at ?? null,
+    },
+    queue: {
+      pending: queueCounts?.pending ?? 0,
+      ready: queueCounts?.ready ?? 0,
+      backoff: queueCounts?.backoff ?? 0,
+      processing: queueCounts?.processing ?? 0,
+      failed: queueCounts?.failed ?? 0,
+      nextRetryAt: queueCounts?.next_retry_at ?? null,
+      oldestEnqueuedAt: queueCounts?.oldest_enqueued_at ?? null,
+      items: postQueueService.listItems({ mappingIds: new Set([mapping.id]), limit: 50 }),
+    },
+    sources: mapping.twitterUsernames.map((username) => {
+      const row = activity.get(username.toLowerCase());
+      const decision = decideCheck(activityFromRow(row), now);
+      return {
+        twitterUsername: username,
+        tier: decision.tier,
+        dueInMs: decision.dueInMs,
+        lastCheckedAt: row?.last_checked_at ?? null,
+        lastFoundAt: row?.last_found_at ?? null,
+        emptyStreak: row?.empty_streak ?? 0,
+        // A renamed, suspended or protected source used to look exactly like
+        // one that had simply gone quiet.
+        lastError: row?.last_error ?? null,
+        lastErrorAt: row?.last_error_at ?? null,
+        errorStreak: row?.error_streak ?? 0,
+        protectedSince: row?.protected_since ?? null,
+        twitterUserId: row?.twitter_user_id ?? null,
+      };
+    }),
+    recentPosts: dbService.getRecentTweetsForIdentifier(mapping.bskyIdentifier, 25),
+    recentLogs: eventLogService.query({ mappingIds: [mapping.id], limit: 40 }),
+  });
+});
+
+// Re-arm rows this account left claimed. A worker that dies mid-batch leaves
+// them in `processing` with nothing working on them, and the account then looks
+// stuck until the whole process restarts.
+app.post('/api/accounts/:id/unjam', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const mapping = config.mappings.find((entry) => entry.id === req.params.id);
+  if (!mapping || !getVisibleMappingIdSet(config, req.user).has(mapping.id)) {
+    res.status(404).json({ error: 'Account not found.' });
+    return;
+  }
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have access to this account.' });
+    return;
+  }
+
+  // Only rows untouched for five minutes, so a batch that is genuinely still
+  // posting is never yanked out from under its worker.
+  const released = postQueueService.resetProcessingForMapping(mapping.id);
+  const retried = req.body?.includeFailed ? postQueueService.retryFailedForMapping(mapping.id) : 0;
+
+  if (released > 0 || retried > 0) {
+    signalSchedulerWake();
+    logEvent({
+      level: 'warn',
+      stage: 'queue',
+      event: 'queue.unjammed',
+      message: `${getActorLabel(req.user)} re-armed ${released} stuck and ${retried} failed queue item(s) for ${mapping.bskyIdentifier}.`,
+      mappingId: mapping.id,
+      bskyIdentifier: mapping.bskyIdentifier,
+      detail: { released, retried },
+    });
+  }
+
+  res.json({
+    success: true,
+    released,
+    retried,
+    message:
+      released === 0 && retried === 0
+        ? 'Nothing was stuck: no queue items needed re-arming.'
+        : `Re-armed ${released} stuck and ${retried} failed item(s).`,
+  });
+});
+
+// Compose recent tweets exactly as the mirror would, without posting them, so
+// an account can be inspected before it is added rather than after it has
+// posted something surprising.
+app.post('/api/preview', authenticateToken, async (req: any, res) => {
+  const twitterUsername = normalizeActor(String(req.body?.twitterUsername ?? ''));
+  if (!twitterUsername) {
+    res.status(400).json({ error: 'A Twitter username is required.' });
+    return;
+  }
+
+  const limitRaw = Number(req.body?.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 10)) : 5;
+
+  // Previewing against an existing mapping shows the thread exactly as that
+  // mirror would post it, so the mapping must be one this user can see.
+  const mappingId = req.body?.mappingId ? String(req.body.mappingId) : undefined;
+  if (mappingId) {
+    const config = getConfig();
+    if (!getVisibleMappingIdSet(config, req.user).has(mappingId)) {
+      res.status(404).json({ error: 'Mapping not found.' });
+      return;
+    }
+  }
+
+  if (!isPreviewAvailable()) {
+    res.status(503).json({ error: 'Preview is not available yet: the mirror process is still starting up.' });
+    return;
+  }
+
+  try {
+    const result = await runPreview({ twitterUsername, mappingId, limit });
+    res.json(result);
+  } catch (error) {
+    // Not everything thrown is an Error; reading .message off a string or an
+    // object would report the failure as "undefined".
+    const message = error instanceof Error ? error.message : String(error);
+    logEvent({
+      level: 'warn',
+      stage: 'post',
+      event: 'preview.failed',
+      message: `Could not preview @${twitterUsername}: ${message}`,
+      twitterUsername,
+      error: { message },
+    });
+    res.status(502).json({ error: `Could not preview @${twitterUsername}: ${message}` });
+  }
+});
+
+// One row per mirrored account, answering "is this mirror healthy?" without
+// reading the log: how fast it mirrors, when it last posted, what is queued or
+// parked, whether the Bluesky account is down, and which polling tier its
+// sources currently sit in.
+app.get('/api/account-health', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const visibleMappingIds = getVisibleMappingIdSet(config, req.user);
+  const windowDaysRaw = Number(req.query.days);
+  const windowDays = Number.isFinite(windowDaysRaw) ? Math.max(1, Math.min(windowDaysRaw, 90)) : 7;
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+
+  // Keys are normalised because rows written before identifiers were lower-cased
+  // would otherwise miss the lookup below and silently report no stats at all.
+  const lagByAccount = new Map(
+    dbService.getMirrorLagStats(windowMs).map((row) => [row.bsky_identifier.toLowerCase(), row]),
+  );
+  const postsByAccount = new Map(
+    dbService.getAccountPostStats(windowMs).map((row) => [row.bsky_identifier.toLowerCase(), row]),
+  );
+  const queueByMapping = new Map(postQueueService.getCounts().perMapping.map((row) => [row.mapping_id, row]));
+  const activity = sourceActivityService.getAll();
+  const now = Date.now();
+
+  const accounts = config.mappings
+    .filter((mapping) => visibleMappingIds.has(mapping.id))
+    .map((mapping) => {
+      const identifier = mapping.bskyIdentifier.toLowerCase();
+      const lag = lagByAccount.get(identifier);
+      const posts = postsByAccount.get(identifier);
+      const queue = queueByMapping.get(mapping.id);
+      const health = accountHealthService.get(mapping.bskyIdentifier);
+
+      // Each mapping can pull from several Twitter accounts, so the card shows
+      // the hottest tier among them — that is what sets the mirror's cadence.
+      const sources = mapping.twitterUsernames.map((username) => {
+        const row = activity.get(username.toLowerCase());
+        const decision = decideCheck(
+          { lastFoundAt: row?.last_found_at ?? undefined, lastCheckedAt: row?.last_checked_at ?? undefined },
+          now,
+        );
+        return {
+          twitterUsername: username,
+          tier: decision.tier,
+          lastCheckedAt: row?.last_checked_at ?? null,
+          lastFoundAt: row?.last_found_at ?? null,
+          dueInMs: decision.dueInMs,
+          lastError: row?.last_error ?? null,
+          protectedSince: row?.protected_since ?? null,
+        };
+      });
+
+      return {
+        mappingId: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        twitterUsernames: mapping.twitterUsernames,
+        enabled: mapping.enabled,
+        groupName: mapping.groupName,
+        groupEmoji: mapping.groupEmoji,
+        down: health ? { state: health.state, reason: health.reason, detectedAt: health.detected_at } : null,
+        lag: lag
+          ? {
+              samples: lag.samples,
+              averageMs: lag.averageLagMs,
+              medianMs: lag.medianLagMs,
+              p95Ms: lag.p95LagMs,
+              worstMs: lag.worstLagMs,
+            }
+          : null,
+        posts: {
+          posted: posts?.posted ?? 0,
+          skipped: posts?.skipped ?? 0,
+          failed: posts?.failed ?? 0,
+          lastPostedAt: posts?.last_posted_at ?? null,
+        },
+        queue: {
+          pending: queue?.pending ?? 0,
+          processing: queue?.processing ?? 0,
+          failed: queue?.failed ?? 0,
+        },
+        sources,
+      };
+    });
+
+  // Instance-wide lag is sample-weighted: averaging per-account averages would
+  // let a mirror with two posts count as much as one with two hundred.
+  const withLag = accounts.filter((account) => account.lag && account.lag.samples > 0);
+  const totalSamples = withLag.reduce((sum, account) => sum + (account.lag?.samples ?? 0), 0);
+  const weightedLag = withLag.reduce(
+    (sum, account) => sum + (account.lag?.averageMs ?? 0) * (account.lag?.samples ?? 0),
+    0,
+  );
+
+  res.json({
+    windowDays,
+    accounts,
+    summary: {
+      accounts: accounts.length,
+      down: accounts.filter((account) => account.down).length,
+      averageLagMs: totalSamples > 0 ? Math.round(weightedLag / totalSamples) : null,
+      lagSamples: totalSamples,
+      postedInWindow: accounts.reduce((sum, account) => sum + account.posts.posted, 0),
+    },
+  });
+});
+
+// Why the failures happened, grouped by reason. This is the answer to "323
+// failed" that the counter alone can never give.
+app.get('/api/queue/failures', authenticateToken, (req: any, res) => {
+  const config = getConfig();
+  const visibleMappingIds = getVisibleMappingIdSet(config, req.user);
+  const limitRaw = Number(req.query.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 500)) : 100;
+
+  res.json({
+    summary: postQueueService.summarizeFailures(visibleMappingIds),
+    items: postQueueService.listItems({ mappingIds: visibleMappingIds, limit, status: 'failed' }),
+  });
+});
+
+app.post('/api/queue/retry-failed', authenticateToken, requireAdmin, (req: any, res) => {
+  const retried = postQueueService.retryFailed();
+  logEvent({
+    level: 'info',
+    stage: 'queue',
+    event: 'queue.retry-failed',
+    message: `${getActorLabel(req.user)} requeued ${retried} failed tweet(s).`,
+    detail: { retried, actor: getActorLabel(req.user) },
+  });
+  res.json({ success: true, message: `${retried} failed tweet(s) requeued.` });
+});
+
+app.delete('/api/queue/failed', authenticateToken, requireAdmin, (req: any, res) => {
+  const cleared = postQueueService.clearFailed();
+  logEvent({
+    level: 'warn',
+    stage: 'queue',
+    event: 'queue.clear-failed',
+    message: `${getActorLabel(req.user)} discarded ${cleared} failed tweet(s) from the queue. They will not be retried.`,
+    detail: { cleared, actor: getActorLabel(req.user) },
+  });
+  res.json({ success: true, message: `${cleared} failed tweet(s) removed from the queue.` });
+});
+
+// ============================================================================
+// Structured log access
+//
+// Non-admins only ever see entries attributable to a mapping they can view.
+// System-level entries (boot, scheduler, housekeeping) carry no account, so
+// they are admin-only rather than leaking cross-tenant activity.
+// ============================================================================
+
+const LOG_LEVELS = new Set<LogLevel>(['debug', 'info', 'warn', 'error']);
+
+function parseListParam(value: unknown): string[] | undefined {
+  if (typeof value !== 'string' || value.trim().length === 0) return undefined;
+  const parts = value
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  return parts.length > 0 ? parts.slice(0, 50) : undefined;
+}
+
+function parseTimestampParam(value: unknown): number | undefined {
+  if (typeof value !== 'string' || value.trim().length === 0) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Turns query params into a filter set, then narrows it to what this user is
+ * allowed to see. Returns null when the user can see nothing at all.
+ */
+function buildScopedLogFilters(req: any): LogQueryFilters | null {
+  const config = getConfig();
+  const filters: LogQueryFilters = {};
+
+  const levels = parseListParam(req.query.level)?.filter((level): level is LogLevel =>
+    LOG_LEVELS.has(level as LogLevel),
+  );
+  if (levels && levels.length > 0) filters.levels = levels;
+
+  const stages = parseListParam(req.query.stage) as LogStage[] | undefined;
+  if (stages && stages.length > 0) filters.stages = stages;
+
+  const events = parseListParam(req.query.event);
+  if (events) filters.events = events;
+
+  if (typeof req.query.q === 'string' && req.query.q.trim().length > 0) {
+    filters.search = req.query.q.trim().slice(0, 200);
+  }
+  if (typeof req.query.tweetId === 'string' && req.query.tweetId.trim().length > 0) {
+    filters.twitterId = req.query.tweetId.trim();
+  }
+  if (typeof req.query.jobId === 'string' && req.query.jobId.trim().length > 0) {
+    filters.jobId = req.query.jobId.trim();
+  }
+
+  const since = parseTimestampParam(req.query.since);
+  if (since !== undefined) filters.since = since;
+  const until = parseTimestampParam(req.query.until);
+  if (until !== undefined) filters.until = until;
+
+  const beforeId = Number(req.query.beforeId);
+  if (Number.isFinite(beforeId) && beforeId > 0) filters.beforeId = beforeId;
+
+  // Explicit account narrowing requested by the caller.
+  const requestedMappings = parseListParam(req.query.mappingId);
+  const requestedAccounts = parseListParam(req.query.account)?.map(normalizeActor);
+
+  if (canViewAllMappings(req.user)) {
+    if (requestedMappings) filters.mappingIds = requestedMappings;
+    if (requestedAccounts) filters.twitterUsernames = requestedAccounts;
+    return filters;
+  }
+
+  // Scoped users: intersect any request with what they own.
+  const visibleMappingIds = [...getVisibleMappingIdSet(config, req.user)];
+  if (visibleMappingIds.length === 0) return null;
+  filters.mappingIds = requestedMappings
+    ? requestedMappings.filter((id) => visibleMappingIds.includes(id))
+    : visibleMappingIds;
+  if (filters.mappingIds.length === 0) return null;
+
+  if (requestedAccounts) {
+    const visibleSets = getVisibleMappingIdentitySets(config, req.user);
+    const allowed = requestedAccounts.filter((account) => visibleSets.twitterUsernames.has(account));
+    if (allowed.length === 0) return null;
+    filters.twitterUsernames = allowed;
+  }
+
+  return filters;
+}
+
+app.get('/api/logs', authenticateToken, (req: any, res) => {
+  const filters = buildScopedLogFilters(req);
+  if (!filters) {
+    res.json({ entries: [], hasMore: false, retention: eventLogService.retention() });
+    return;
+  }
+
+  const limitRaw = Number(req.query.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 1000)) : 200;
+  // Ask for one extra row so the client knows whether to offer "load more"
+  // without a second count query.
+  const entries = eventLogService.query({ ...filters, limit: limit + 1 });
+  const hasMore = entries.length > limit;
+
+  res.json({
+    entries: hasMore ? entries.slice(0, limit) : entries,
+    hasMore,
+    retention: eventLogService.retention(),
+  });
+});
+
+app.get('/api/logs/stats', authenticateToken, (req: any, res) => {
+  const filters = buildScopedLogFilters(req);
+  if (!filters) {
+    res.json({ total: 0, byLevel: {}, byStage: {}, topEvents: [], oldestTs: null, newestTs: null });
+    return;
+  }
+  res.json(eventLogService.stats(filters));
+});
+
+// Everything recorded about one tweet, in order. Answers "what actually
+// happened to this post" in a single request.
+app.get('/api/logs/tweet/:twitterId', authenticateToken, (req: any, res) => {
+  const twitterId = String(req.params.twitterId || '').trim();
+  if (!twitterId) {
+    res.status(400).json({ error: 'A tweet id is required.' });
+    return;
+  }
+
+  const config = getConfig();
+  const entries = eventLogService.timelineForTweet(twitterId);
+  if (canViewAllMappings(req.user)) {
+    res.json({ twitterId, entries });
+    return;
+  }
+
+  const visibleSets = getVisibleMappingIdentitySets(config, req.user);
+  const visibleMappingIds = getVisibleMappingIdSet(config, req.user);
+  res.json({
+    twitterId,
+    entries: entries.filter(
+      (entry) =>
+        (entry.mappingId && visibleMappingIds.has(entry.mappingId)) ||
+        (entry.twitterUsername && visibleSets.twitterUsernames.has(normalizeActor(entry.twitterUsername))) ||
+        (entry.bskyIdentifier && visibleSets.bskyIdentifiers.has(normalizeActor(entry.bskyIdentifier))),
+    ),
+  });
+});
+
+// Downloadable export. `format` decides the rendering; every filter accepted by
+// /api/logs works here too, so what you are looking at is what you download.
+app.get('/api/logs/export', authenticateToken, (req: any, res) => {
+  const filters = buildScopedLogFilters(req);
+  const requestedFormat = String(req.query.format || 'txt').toLowerCase();
+  const format: LogExportFormat = (['json', 'ndjson', 'csv', 'txt'] as const).includes(requestedFormat as any)
+    ? (requestedFormat as LogExportFormat)
+    : 'txt';
+
+  const limitRaw = Number(req.query.limit);
+  const hardLimit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 200_000)) : 50_000;
+
+  const meta = {
+    generatedAt: new Date().toISOString(),
+    filters: filters ?? {},
+    appVersion: getRuntimeVersionInfo().version,
+    exportedBy: getActorLabel(req.user),
+  };
+
+  const { body, contentType, filename } = filters
+    ? exportLogs(format, filters, meta, hardLimit)
+    : exportLogs(format, { beforeId: 0 }, meta, 0);
+
+  logEvent({
+    level: 'info',
+    stage: 'http',
+    event: 'logs.exported',
+    message: `${getActorLabel(req.user)} exported logs as ${format}.`,
+    detail: { format, bytes: body.length, filters: filters ?? {} },
+    console: false,
+  });
+
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(body);
+});
+
+// One file with everything a bug report needs: recent logs, the current queue
+// state, failure groupings and a redacted config summary.
+app.get('/api/logs/diagnostics', authenticateToken, requireAdmin, (req: any, res) => {
+  const config = getConfig();
+  const queueCounts = postQueueService.getCounts();
+  const stats = eventLogService.stats({ since: Date.now() - 24 * 60 * 60 * 1000 });
+  const entries = eventLogService.query({ limit: 2_000 });
+
+  const bundle = {
+    meta: {
+      generatedAt: new Date().toISOString(),
+      generatedBy: getActorLabel(req.user),
+      appVersion: getRuntimeVersionInfo().version,
+      node: process.version,
+      platform: `${process.platform}/${process.arch}`,
+      uptimeSeconds: Math.round(process.uptime()),
+      logRetention: eventLogService.retention(),
+    },
+    // Shape only — no cookies, passwords or tokens.
+    configuration: {
+      checkIntervalMinutes: config.checkIntervalMinutes,
+      mappingCount: config.mappings.length,
+      enabledMappingCount: config.mappings.filter((mapping) => mapping.enabled).length,
+      twitterCookiesConfigured: Boolean(config.twitter?.authToken && config.twitter?.ct0),
+      backupCookiesConfigured: Boolean(config.twitter?.backupAuthToken && config.twitter?.backupCt0),
+      mappings: config.mappings.map((mapping) => ({
+        id: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        twitterUsernames: mapping.twitterUsernames,
+        enabled: mapping.enabled,
+      })),
+    },
+    queue: {
+      counts: queueCounts,
+      failureSummary: postQueueService.summarizeFailures(),
+      failedItems: postQueueService.listItems({ limit: 500, status: 'failed' }),
+    },
+    logStatsLast24h: stats,
+    recentEntries: entries,
+  };
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="tweets-2-bsky-diagnostics-${stamp}.json"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`${JSON.stringify(bundle, null, 2)}\n`);
+});
+
+app.delete('/api/logs', authenticateToken, requireAdmin, (req: any, res) => {
+  const cleared = eventLogService.clear();
+  logEvent({
+    level: 'warn',
+    stage: 'system',
+    event: 'logs.cleared',
+    message: `${getActorLabel(req.user)} cleared the event log (${cleared} entries removed).`,
+    detail: { cleared },
+  });
+  res.json({ success: true, message: `Cleared ${cleared} log entr${cleared === 1 ? 'y' : 'ies'}.` });
 });
 
 app.get('/api/version', authenticateToken, (_req, res) => {
@@ -2844,12 +3832,30 @@ app.post('/api/run-now', authenticateToken, (req: any, res) => {
     return;
   }
 
-  requestImmediateSchedulerPass();
-  res.json({ success: true, message: 'Check triggered' });
+  // Optional: force just one account's sources (the account page's button).
+  const mappingId = typeof req.body?.mappingId === 'string' ? req.body.mappingId : undefined;
+  if (mappingId) {
+    const config = getConfig();
+    if (!getVisibleMappingIdSet(config, req.user).has(mappingId)) {
+      res.status(404).json({ error: 'Account not found.' });
+      return;
+    }
+  }
+
+  const { forced } = requestImmediateSchedulerPass({ mappingId });
+  res.json({
+    success: true,
+    forced,
+    message:
+      forced === 'none'
+        ? 'Check triggered. Every account was force-checked in the last few minutes, so this runs a normal sweep.'
+        : 'Check triggered',
+  });
 });
 
 app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res) => {
   pendingBackfills = [];
+  postQueueService.cancelPendingBackfills();
   updateAppStatus({
     state: 'idle',
     message: 'All backfills cleared',
@@ -2909,6 +3915,41 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
   });
 });
 
+app.post('/api/pin-sync/:id', authenticateToken, (req: any, res) => {
+  if (!canQueueBackfills(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to sync pinned tweets.' });
+    return;
+  }
+
+  const { id } = req.params;
+  const config = getConfig();
+  const mapping = config.mappings.find((m) => m.id === id);
+
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have access to this mapping.' });
+    return;
+  }
+
+  if (!Array.isArray(mapping.twitterUsernames) || mapping.twitterUsernames.length === 0) {
+    res.status(400).json({ error: 'Mapping has no Twitter source accounts configured.' });
+    return;
+  }
+
+  pendingPinSyncs = pendingPinSyncs.filter((entry) => entry.id !== id);
+  pendingPinSyncs.push({ id, queuedAt: Date.now(), requestId: randomUUID() });
+  signalSchedulerWake();
+
+  res.json({
+    success: true,
+    message: `Pin sync queued for ${mapping.bskyIdentifier}`,
+  });
+});
+
 app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
   const config = getConfig();
@@ -2925,8 +3966,64 @@ app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
   }
 
   pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
+  postQueueService.cancelPendingBackfills(id);
   signalSchedulerWake();
   res.json({ success: true });
+});
+
+// --- Discovery: per-group lists and starter packs ---
+
+app.get('/api/discovery', authenticateToken, (_req: any, res) => {
+  const config = getConfig();
+  res.json({
+    curatorMappingId: config.discovery?.curatorMappingId ?? null,
+    groups: config.groups.map((group) => ({
+      name: group.name,
+      listUri: group.listUri ?? null,
+      starterPackUri: group.starterPackUri ?? null,
+      lastDiscoverySyncAt: group.lastDiscoverySyncAt ?? null,
+    })),
+  });
+});
+
+app.put('/api/discovery', authenticateToken, requireAdmin, (req: any, res) => {
+  const curatorMappingId = normalizeOptionalString(req.body?.curatorMappingId);
+  const config = getConfig();
+  if (curatorMappingId && !config.mappings.some((mapping) => mapping.id === curatorMappingId)) {
+    res.status(400).json({ error: 'That curator account does not exist.' });
+    return;
+  }
+  updateConfig((fresh) => {
+    fresh.discovery = curatorMappingId ? { curatorMappingId } : undefined;
+    return true;
+  });
+  res.json({ success: true, curatorMappingId: curatorMappingId ?? null });
+});
+
+app.post('/api/groups/:groupKey/discovery-sync', authenticateToken, async (req: any, res) => {
+  if (!req.user?.isAdmin && !canManageGroups(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to manage groups.' });
+    return;
+  }
+  const groupKey = decodeURIComponent(String(req.params.groupKey || ''));
+  try {
+    const outcome = await syncDiscoveryForGroup(groupKey);
+    res.json({
+      success: true,
+      ...outcome,
+      message: [
+        `Starter pack for "${outcome.group}" is up to date with ${outcome.members} account(s).`,
+        outcome.belowRecommendedSize ? 'Bluesky recommends at least 7 accounts in a starter pack.' : '',
+        outcome.unresolved.length > 0
+          ? `${outcome.unresolved.length} account(s) could not be resolved yet and were left out.`
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    });
+  } catch (error) {
+    res.status(400).json({ error: getErrorMessage(error, 'Could not sync the starter pack.') });
+  }
 });
 
 // --- Config Management Routes ---
@@ -3077,6 +4174,11 @@ export function updateLastCheckTime() {
   const config = getConfig();
   lastCheckTime = Date.now();
   nextCheckTime = lastCheckTime + (config.checkIntervalMinutes || 5) * 60 * 1000;
+}
+
+/** Snapshot of the dashboard's global status (tests use it to prove the preview leaves it alone). */
+export function getAppStatus(): AppStatus {
+  return { ...currentAppStatus };
 }
 
 export function updateAppStatus(status: Partial<AppStatus>) {
